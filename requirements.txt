@@ -1,0 +1,9 @@
+lancedb
+pydantic-settings
+mcp
+python-dotenv
+google-generativeai
+fastapi
+aiohttp
+pyarrow
+pandas
