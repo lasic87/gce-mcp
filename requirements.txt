@@ -2,7 +2,7 @@ lancedb
 pydantic-settings
 mcp
 python-dotenv
-google-generativeai
+google-genai
 fastapi
 aiohttp
 pyarrow

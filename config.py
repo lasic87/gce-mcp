@@ -10,6 +10,10 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "nomic-embed-text" # Możemy zmienić na inny wspierany przez Ollamę
     GOOGLE_API_KEY: str = os.getenv("GOOGLE_API_KEY", "")
     
+    # Parametry fragmentacji tekstu
+    CHUNK_SIZE: int = 2000
+    CHUNK_OVERLAP: int = 200
+    
     # Modele do Juggler'a (nazwa, rpm_limit, rpd_limit)
     MODEL_POOL: list[dict] = [
         {"name": "models/gemini-3.1-flash-lite-preview", "rpm": 15, "rpd": 500},

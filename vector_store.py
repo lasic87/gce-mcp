@@ -33,12 +33,13 @@ class VectorStore:
         # Inicjalizacja rerankera RRF (Reciprocal Rank Fusion)
         self.reranker = RRFReranker()
         
-        # Tworzenie indeksu FTS dla wyszukiwania pełnotekstowego
+        # Tworzenie osobnych indeksów FTS dla wyszukiwania pełnotekstowego
         try:
             self.table.create_fts_index("text", replace=True)
-            logger.info("FTS index created/refreshed on 'text' column.")
+            self.table.create_fts_index("abstract", replace=True)
+            logger.info("FTS indexes created/refreshed on 'text' and 'abstract' columns.")
         except Exception as e:
-            logger.warning(f"Could not create FTS index: {e}")
+            logger.warning(f"Could not create FTS indexes: {e}")
 
     def add_documents(self, documents: List[dict]):
         """Dodaje listę fragmentów dokumentów do bazy."""

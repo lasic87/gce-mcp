@@ -7,22 +7,51 @@ from config import settings
 from vector_store import vector_store
 from embedding_engine import embedding_engine
 from quota_manager import quota_manager
+from text_utils import RecursiveCharacterTextSplitter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("GCE-MCP")
 
 mcp = FastMCP("GCE-MCP")
 
+# Inicjalizacja splittera zgodnie z ustawieniami
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=settings.CHUNK_SIZE,
+    chunk_overlap=settings.CHUNK_OVERLAP
+)
+
 @mcp.tool()
-async def gce_add_resource(uri: str, content: str, abstract: str = "") -> str:
+async def gce_add_resource(uri: str, content: str = "", abstract: str = "") -> str:
     """Indeksuje nowy zasób w bazie GCE (podział na fragmenty i wektoryzacja)."""
     try:
-        # TODO: przejść na RecursiveCharacterTextSplitter
-        chunks = [content[i:i+2000] for i in range(0, len(content), 1800)]
+        # Jeśli content jest pusty, spróbuj odczytać plik z dysku (traktując uri jako ścieżkę)
+        if not content:
+            if os.path.exists(uri):
+                with open(uri, 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()
+            else:
+                return f"Błąd: Nie podano treści, a plik '{uri}' nie istnieje lokalnie."
+
+        # Jeśli abstract jest pusty, wygeneruj go automatycznie (L0 Context)
+        if not abstract:
+            logger.info(f"Generowanie abstraktu dla {uri}...")
+            try:
+                # Prompt inspirowany OpenSpace dla lepszego kontekstu L0
+                prompt = f"Wygeneruj bardzo krótki, techniczny abstrakt (max 2 zdania) dla pliku: {uri}\n\nTREŚĆ:\n{content[:2000]}"
+                abstract = await quota_manager.generate_content(prompt)
+                logger.info(f"Abstrakt wygenerowany: {abstract[:100]}...")
+            except Exception as e:
+                logger.warning(f"Nie udało się wygenerować abstraktu: {e}")
+                abstract = f"Zasób: {uri}"
+
+        # Inteligentne dzielenie tekstu (OpenSpace style)
+        logger.info(f"Dzielenie {uri} na fragmenty (Recursive)...")
+        chunks = text_splitter.split_text(content)
         
         doc_chunks = []
         for i, chunk in enumerate(chunks):
             chunk_uri = f"{uri}#chunk{i}"
+            # Wektoryzujemy Abstrakt + Fragment dla lepszej retencji semantycznej
             vector = await embedding_engine.embed_text(f"{abstract}\n\n{chunk}")
             
             doc_chunks.append({
@@ -34,9 +63,9 @@ async def gce_add_resource(uri: str, content: str, abstract: str = "") -> str:
             })
         
         vector_store.add_documents(doc_chunks)
-        return f"OK. Zindeksowano {len(doc_chunks)} fragmentów dla {uri}"
+        return f"Sukces. Zasób {uri} dodany z abstraktem ({len(doc_chunks)} fragmentów)."
     except Exception as e:
-        logger.error(f"Index error: {e}")
+        logger.error(f"Index error for {uri}: {e}")
         return f"Błąd indeksowania: {e}"
 
 @mcp.tool()
