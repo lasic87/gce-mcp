@@ -7,19 +7,25 @@ class RecursiveCharacterTextSplitter:
     def __init__(self, chunk_size: int = 2000, chunk_overlap: int = 200, separators: List[str] = None):
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
-        self.separators = separators or ["\n\n", "\n", ". ", " ", ""]
+        # Domyślne separatory zorientowane na Markdown i strukturę tekstu
+        self.separators = separators or [
+            "\n# ", "\n## ", "\n### ", "\n#### ",  # Nagłówki Markdown
+            "\n```",                                # Bloki kodu
+            "\n\n", "\n",                           # Akapity i linie
+            ". ", "? ", "! ",                       # Koniec zdania
+            ", ", " ", ""                           # Słowa i znaki
+        ]
 
     def split_text(self, text: str) -> List[str]:
         """
         Dzieli tekst rekurencyjnie używając listy separatorów.
         Gwarantuje, że fragmenty nie przekraczają chunk_size i mają określony overlap.
         """
+        if not text:
+            return []
+            
         final_chunks = []
-        
-        # Start rekurencji
         self._recursive_split(text, self.separators, final_chunks)
-        
-        # Łączenie małych fragmentów w większe (do limitu chunk_size) z uwzględnieniem overlapu
         return self._merge_splits(final_chunks)
 
     def _recursive_split(self, text: str, separators: List[str], chunks: List[str]):
@@ -27,32 +33,39 @@ class RecursiveCharacterTextSplitter:
             chunks.append(text)
             return
 
-        # Wybór separatora
-        separator = separators[-1]
+        # Wybór najlepszego separatora z dostępnych
+        selected_separator = separators[-1]
         for s in separators:
             if s in text:
-                separator = s
+                selected_separator = s
                 break
         
         # Dzielenie po wybranym separatorze
-        splits = text.split(separator)
+        # Jeśli separator to nagłówek, zachowujemy go na początku fragmentu (split z regex by był lepszy, ale użyjemy sprytnego join)
+        splits = text.split(selected_separator)
         
+        current_text = ""
         for i, s in enumerate(splits):
-            # Dodajemy separator z powrotem (poza ostatnim elementem)
-            if i < len(splits) - 1:
-                s = s + separator
-            
-            if len(s) <= self.chunk_size:
-                chunks.append(s)
+            # Przywracamy separator (chyba że to pierwszy element i split był na początku)
+            if i > 0:
+                item = selected_separator + s
             else:
-                # Jeśli fragment nadal za duży, szukamy następnego separatora
-                next_separators = separators[separators.index(separator) + 1:]
+                item = s
+            
+            if not item: continue
+
+            if len(item) <= self.chunk_size:
+                chunks.append(item)
+            else:
+                # Jeśli fragment nadal za duży, szukamy następnego separatora w hierarchii
+                sep_idx = separators.index(selected_separator)
+                next_separators = separators[sep_idx + 1:]
                 if next_separators:
-                    self._recursive_split(s, next_separators, chunks)
+                    self._recursive_split(item, next_separators, chunks)
                 else:
-                    # Ostateczne cięcie na sztywno, jeśli brak separatorów
-                    for j in range(0, len(s), self.chunk_size):
-                        chunks.append(s[j:j + self.chunk_size])
+                    # Ostateczne cięcie na sztywno
+                    for j in range(0, len(item), self.chunk_size):
+                        chunks.append(item[j:j + self.chunk_size])
 
     def _merge_splits(self, splits: List[str]) -> List[str]:
         merged = []

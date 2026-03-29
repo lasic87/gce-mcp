@@ -33,13 +33,41 @@ class VectorStore:
         # Inicjalizacja rerankera RRF (Reciprocal Rank Fusion)
         self.reranker = RRFReranker()
         
-        # Tworzenie osobnych indeksów FTS dla wyszukiwania pełnotekstowego
+        # Optymalizacja: Tworzenie indeksów FTS tylko jeśli tabela ma dane i indeksy nie istnieją (lub replace=False)
+        if self.table.count_rows() > 0:
+            try:
+                # LanceDB v0.17+ automatycznie zarządza indeksami, ale dla pewności 
+                # sprawdzamy czy wyszukiwanie FTS działa zamiast wymuszać replace=True
+                logger.info("FTS check...")
+                # Próba wyszukiwania testowego
+                self.table.search("test", query_type="fts").limit(1).to_list()
+            except Exception:
+                logger.info("Creating FTS indexes on 'text' and 'abstract' columns...")
+                self.table.create_fts_index("text", replace=True)
+                self.table.create_fts_index("abstract", replace=True)
+
+    def get_stats(self) -> dict:
+        """Pobiera statystyki bazy danych LanceDB."""
+        total_chunks = self.table.count_rows()
+        # Pobieramy unikalne URI (usuwając suffix #chunk)
         try:
-            self.table.create_fts_index("text", replace=True)
-            self.table.create_fts_index("abstract", replace=True)
-            logger.info("FTS indexes created/refreshed on 'text' and 'abstract' columns.")
+            # Używamy prostego selecta, by wyciągnąć unikalne ścieżki
+            all_uris = [res['uri'].split('#')[0] for res in self.table.search().to_list()]
+            unique_resources = len(set(all_uris))
+            
+            # Liczba wspomnień (memories)
+            memories_count = len([u for u in set(all_uris) if u.startswith("gce://user/memories/")])
         except Exception as e:
-            logger.warning(f"Could not create FTS indexes: {e}")
+            logger.error(f"Stats error: {e}")
+            unique_resources = 0
+            memories_count = 0
+
+        return {
+            "total_chunks": total_chunks,
+            "unique_resources": unique_resources,
+            "memories_count": memories_count,
+            "db_path": settings.GCE_DB_PATH
+        }
 
     def add_documents(self, documents: List[dict]):
         """Dodaje listę fragmentów dokumentów do bazy."""

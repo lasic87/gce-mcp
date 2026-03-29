@@ -59,6 +59,20 @@ class QuotaManager:
                 return True
         return False
 
+    def get_stats(self) -> list[dict]:
+        """Zwraca listę statystyk dla wszystkich modeli w puli."""
+        stats_list = []
+        for s in self.pool:
+            stats_list.append({
+                "name": s.name,
+                "rpm": s.current_rpm,
+                "rpm_limit": s.rpm_limit,
+                "rpd": s.current_rpd,
+                "rpd_limit": s.rpd_limit,
+                "is_blocked": s.is_blocked_until is not None and datetime.now() < s.is_blocked_until
+            })
+        return stats_list
+
     async def generate_content(self, prompt: str) -> str:
         """
         Generuje treść używając aktualnie dostępnego modelu (nowe SDK google-genai).
