@@ -175,8 +175,35 @@ async def gce_add_resource(uri: str, content: str = "", abstract: str = "") -> s
         return await gce_guardian_diagnostic(e, "gce_add_resource", f"URI: {uri}")
 
 @mcp.tool()
+async def gce_add_relation(subject_uri: str, predicate: str, object_uri: str) -> str:
+    """Tworzy relację między dwoma zasobami w GCE (np. 'depends_on', 'part_of', 'at_ip')."""
+    try:
+        import json
+        # Aktualizacja metadanych podmiotu
+        relation = {"predicate": predicate, "object_uri": object_uri}
+        
+        # Pobieramy aktualne metadane
+        doc = vector_store.get_by_uri(subject_uri)
+        if not doc:
+            return f"Błąd: Podmiot {subject_uri} nie istnieje w bazie."
+            
+        current_meta = json.loads(doc.get('metadata', '{}'))
+        relations = current_meta.get('relations', [])
+        
+        # Unikanie duplikatów
+        if not any(r['predicate'] == predicate and r['object_uri'] == object_uri for r in relations):
+            relations.append(relation)
+            current_meta['relations'] = relations
+            vector_store.update_metadata(subject_uri, current_meta)
+            return f"Sukces: Utworzono relację {subject_uri} --({predicate})--> {object_uri}"
+        else:
+            return f"Relacja już istnieje."
+    except Exception as e:
+        return f"Błąd tworzenia relacji: {e}"
+
+@mcp.tool()
 async def gce_add_memory(content: str, label: str) -> str:
-    """Zapisuje fakt lub preferencję użytkownika bezpośrednio w GCE."""
+    """Zapisuje fakt lub preferencję użytkownika bezpośrednio w GCE (v2.0 z autorelami)."""
     try:
         safe_label = re.sub(r'[^a-z0-9]', '_', label.lower())
         uri = f"gce://user/memories/{safe_label}"
@@ -188,6 +215,19 @@ async def gce_add_memory(content: str, label: str) -> str:
         except:
             abstract = f"Memory: {label}"
 
+        # GCE 2.0: Próba automatycznego wykrycia relacji
+        metadata = {"relations": []}
+        try:
+            # Szybkie wyszukiwanie podobnych faktów, aby zaproponować relację
+            query_vector = await embedding_engine.embed_text(content)
+            similar = vector_store.hybrid_search(query=content, query_vector=query_vector, limit=2)
+            for res in similar:
+                if res['uri'] != uri:
+                    metadata['relations'].append({"predicate": "related_to", "object_uri": res['uri']})
+        except:
+            pass
+
+        import json
         vector = await embedding_engine.embed_text(f"{abstract}\n\n{content}")
         
         vector_store.add_documents([{
@@ -195,10 +235,10 @@ async def gce_add_memory(content: str, label: str) -> str:
             "text": content,
             "abstract": abstract,
             "vector": vector,
-            "metadata": "{}"
+            "metadata": json.dumps(metadata)
         }])
         
-        return f"Zapamiętano: {uri} (Label: {abstract})"
+        return f"Zapamiętano: {uri} (Label: {abstract})\nDodano {len(metadata['relations'])} automatycznych relacji."
     except Exception as e:
         return await gce_guardian_diagnostic(e, "gce_add_memory", f"Label: {label}")
 
