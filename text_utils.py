@@ -16,6 +16,30 @@ class RecursiveCharacterTextSplitter:
             ", ", " ", ""                           # Słowa i znaki
         ]
 
+    @classmethod
+    def from_language(cls, language: str, chunk_size: int = 2000, chunk_overlap: int = 200):
+        """Tworzy splitter ze specyficznymi separatorami dla danego języka."""
+        separators = {
+            "python": [
+                "\nclass ", "\ndef ", "\n\tdef ", "\n\t\tdef ",  # Klasy i funkcje
+                "\n\n", "\n", "\n ", " ", ""                      # Struktura i spacje
+            ],
+            "js": [
+                "\nfunction ", "\nclass ", "\nconst ", "\nlet ", "\nvar ",
+                "\n\n", "\n", " ", ""
+            ],
+            "ts": [
+                "\ninterface ", "\ntype ", "\nclass ", "\nfunction ", "\nconst ",
+                "\n\n", "\n", " ", ""
+            ],
+            "markdown": [
+                "\n# ", "\n## ", "\n### ", "\n#### ", "\n##### ", "\n###### ",
+                "\n```", "\n\n", "\n", " ", ""
+            ]
+        }.get(language.lower(), None)
+        
+        return cls(chunk_size=chunk_size, chunk_overlap=chunk_overlap, separators=separators)
+
     def split_text(self, text: str) -> List[str]:
         """
         Dzieli tekst rekurencyjnie używając listy separatorów.

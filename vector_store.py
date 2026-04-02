@@ -47,26 +47,47 @@ class VectorStore:
                 self.table.create_fts_index("abstract", replace=True)
 
     def get_stats(self) -> dict:
-        """Pobiera statystyki bazy danych LanceDB."""
+        """Pobiera rozszerzone statystyki bazy danych LanceDB."""
         total_chunks = self.table.count_rows()
-        # Pobieramy unikalne URI (usuwając suffix #chunk)
         try:
-            # Używamy prostego selecta, by wyciągnąć unikalne ścieżki
-            all_uris = [res['uri'].split('#')[0] for res in self.table.search().to_list()]
-            unique_resources = len(set(all_uris))
+            # Pobieramy wszystkie URI z tabeli
+            results = self.table.search().to_list()
+            all_uris_full = [res['uri'] for res in results]
+            
+            # Unikalne zasoby (bez fragmentów)
+            base_uris = [u.split('#')[0] for u in all_uris_full]
+            unique_resources = len(set(base_uris))
             
             # Liczba wspomnień (memories)
-            memories_count = len([u for u in set(all_uris) if u.startswith("gce://user/memories/")])
+            memories_count = len([u for u in set(base_uris) if u.startswith("gce://user/memories/")])
+            
+            # Top 5 największych zasobów
+            from collections import Counter
+            counts = Counter(base_uris)
+            top_resources = [{"uri": uri, "chunks": count} for uri, count in counts.most_common(5)]
+            
+            # Rozmiar na dysku
+            import subprocess
+            try:
+                du_output = subprocess.check_output(['du', '-sh', settings.GCE_DB_PATH]).decode('utf-8')
+                db_size = du_output.split()[0]
+            except:
+                db_size = "unknown"
+                
         except Exception as e:
             logger.error(f"Stats error: {e}")
             unique_resources = 0
             memories_count = 0
+            top_resources = []
+            db_size = "error"
 
         return {
             "total_chunks": total_chunks,
             "unique_resources": unique_resources,
             "memories_count": memories_count,
-            "db_path": settings.GCE_DB_PATH
+            "db_path": settings.GCE_DB_PATH,
+            "db_size": db_size,
+            "top_resources": top_resources
         }
 
     def add_documents(self, documents: List[dict]):

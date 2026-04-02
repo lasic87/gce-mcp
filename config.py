@@ -14,6 +14,17 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 2000
     CHUNK_OVERLAP: int = 200
     
+    # GCE 2.2: Stabilność i Inteligentne Indeksowanie
+    INDEX_CACHE_PATH: str = "/root/gce-mcp/data/index_cache.json"
+    THROTTLE_DELAY: float = 2.0  # Sekundy przerwy dla ochrony CPU/Routera
+    IGNORE_PATTERNS: list[str] = [
+        "node_modules", ".git", ".venv", "__pycache__", 
+        "dist", ".next", "build", ".cache", ".npm"
+    ]
+    
+    # GCE 2.3: Orchestrator Ready
+    PROJECT_CONTEXT_DIR: str = ".gce" # Folder bazy wiedzy wewnątrz projektu
+    
     # Modele do Juggler'a (nazwa, rpm_limit, rpd_limit)
     MODEL_POOL: list[dict] = [
         {"name": "models/gemini-3.1-flash-lite-preview", "rpm": 15, "rpd": 500},
