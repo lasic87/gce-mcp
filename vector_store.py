@@ -16,6 +16,7 @@ class ContextDocument(LanceModel):
     abstract: str = ""
     vector: Vector(768)
     metadata: str = "{}"
+    namespace: str = "default"
 
 class VectorStore:
     def __init__(self):
@@ -29,17 +30,14 @@ class VectorStore:
         else:
             self.table = self.db.open_table(self.table_name)
             logger.info(f"Opened LanceDB table: {self.table_name}")
+            # GCE 2.5 Migration: Ensure namespace column exists (dynamic in LanceDB)
         
         # Inicjalizacja rerankera RRF (Reciprocal Rank Fusion)
         self.reranker = RRFReranker()
         
-        # Optymalizacja: Tworzenie indeksów FTS tylko jeśli tabela ma dane i indeksy nie istnieją (lub replace=False)
+        # Optymalizacja: Tworzenie indeksów FTS
         if self.table.count_rows() > 0:
             try:
-                # LanceDB v0.17+ automatycznie zarządza indeksami, ale dla pewności 
-                # sprawdzamy czy wyszukiwanie FTS działa zamiast wymuszać replace=True
-                logger.info("FTS check...")
-                # Próba wyszukiwania testowego
                 self.table.search("test", query_type="fts").limit(1).to_list()
             except Exception:
                 logger.info("Creating FTS indexes on 'text' and 'abstract' columns...")
@@ -50,23 +48,18 @@ class VectorStore:
         """Pobiera rozszerzone statystyki bazy danych LanceDB."""
         total_chunks = self.table.count_rows()
         try:
-            # Pobieramy wszystkie URI z tabeli
             results = self.table.search().to_list()
             all_uris_full = [res['uri'] for res in results]
+            namespaces = list(set([res.get('namespace', 'default') for res in results]))
             
-            # Unikalne zasoby (bez fragmentów)
             base_uris = [u.split('#')[0] for u in all_uris_full]
             unique_resources = len(set(base_uris))
-            
-            # Liczba wspomnień (memories)
             memories_count = len([u for u in set(base_uris) if u.startswith("gce://user/memories/")])
             
-            # Top 5 największych zasobów
             from collections import Counter
             counts = Counter(base_uris)
             top_resources = [{"uri": uri, "chunks": count} for uri, count in counts.most_common(5)]
             
-            # Rozmiar na dysku
             import subprocess
             try:
                 du_output = subprocess.check_output(['du', '-sh', settings.GCE_DB_PATH]).decode('utf-8')
@@ -80,6 +73,7 @@ class VectorStore:
             memories_count = 0
             top_resources = []
             db_size = "error"
+            namespaces = ["default"]
 
         return {
             "total_chunks": total_chunks,
@@ -87,70 +81,59 @@ class VectorStore:
             "memories_count": memories_count,
             "db_path": settings.GCE_DB_PATH,
             "db_size": db_size,
-            "top_resources": top_resources
+            "top_resources": top_resources,
+            "namespaces": namespaces
         }
 
     def add_documents(self, documents: List[dict]):
-        """Dodaje listę fragmentów dokumentów do bazy."""
+        """Dodaje listę fragmentów dokumentów do bazy (obsługa namespace)."""
         if not documents:
             return
             
         base_uri = documents[0]['uri'].split('#')[0]
+        # Ustawiamy domyślny namespace jeśli brak
+        for doc in documents:
+            if 'namespace' not in doc:
+                doc['namespace'] = 'default'
+
         try:
-            # Usuwamy stare fragmenty dla tego samego zasobu, aby uniknąć duplikatów
             self.table.delete(f"uri LIKE '{base_uri}%'")
         except Exception as e:
             logger.debug(f"No existing documents to delete for {base_uri}: {e}")
             
         self.table.add(documents)
-        logger.info(f"Added/Updated {len(documents)} chunks for: {base_uri}")
+        logger.info(f"Added/Updated {len(documents)} chunks for: {base_uri} in namespace {documents[0]['namespace']}")
 
-    def update_metadata(self, uri: str, metadata_update: dict):
-        """Aktualizuje metadane dla konkretnego URI (merge JSON)."""
-        import json
-        doc = self.get_by_uri(uri)
-        if not doc:
-            logger.error(f"Document not found for metadata update: {uri}")
-            return False
-            
-        try:
-            current_meta = json.loads(doc.get('metadata', '{}'))
-            current_meta.update(metadata_update)
-            new_meta_str = json.dumps(current_meta)
-            
-            # W LanceDB update wykonujemy przez delete + add (dla bezpieczeństwa spójności w tej wersji)
-            # lub przez update() jeśli tabela to obsługuje.
-            self.table.update(where=f"uri = '{uri}'", values={"metadata": new_meta_str})
-            logger.info(f"Updated metadata for {uri}")
-            return True
-        except Exception as e:
-            logger.error(f"Metadata update failed for {uri}: {e}")
-            return False
-
-    def hybrid_search(self, query: str, query_vector: List[float], limit: int = 5, where: Optional[str] = None) -> List[dict]:
+    def hybrid_search(self, query: str, query_vector: List[float], limit: int = 5, where: Optional[str] = None, namespace: Optional[str] = None) -> List[dict]:
         """
-        Wyszukiwanie hybrydowe z opcjonalnym rozszerzeniem o relacje.
+        Wyszukiwanie hybrydowe z opcjonalnym filtrowaniem po namespace.
         """
         import json
         try:
+            # Budowanie warunku WHERE dla namespace
+            ns_filter = f"namespace = '{namespace}'" if namespace else None
+            
+            if where and ns_filter:
+                final_where = f"({where}) AND ({ns_filter})"
+            else:
+                final_where = where or ns_filter
+
             search_builder = self.table.search(query_type="hybrid") \
                 .vector(query_vector) \
                 .text(query) \
                 .rerank(self.reranker) \
                 .limit(limit)
             
-            if where:
-                search_builder = search_builder.where(where)
+            if final_where:
+                search_builder = search_builder.where(final_where)
                 
             results = search_builder.to_list()
             
-            # GCE 2.0: Automatyczne dociąganie powiązanych faktów (Simple Graph Traversal)
             enhanced_results = []
             seen_uris = {res['uri'] for res in results}
             
             for res in results:
                 enhanced_results.append(res)
-                # Sprawdzamy czy są relacje typu "see_also" lub "depends_on"
                 try:
                     meta = json.loads(res.get('metadata', '{}'))
                     relations = meta.get('relations', [])
@@ -165,9 +148,10 @@ class VectorStore:
                 except:
                     continue
                 
-            return enhanced_results[:limit + 2] # Pozwalamy na lekkie przekroczenie limitu dla relacji
+            return enhanced_results[:limit + 2]
         except Exception as e:
             logger.error(f"Hybrid search failed: {e}")
+            # Fallback bez hybrydy jeśli coś pójdzie nie tak (np. brak indeksu FTS)
             return self.table.search(query_vector).limit(limit).to_list()
 
 
