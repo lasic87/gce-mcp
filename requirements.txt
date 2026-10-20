@@ -7,3 +7,4 @@ fastapi
 aiohttp
 pyarrow
 pandas
+pylance

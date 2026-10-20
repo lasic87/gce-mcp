@@ -5,6 +5,7 @@ import hashlib
 import json
 import asyncio
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional, Any
 from mcp.server.fastmcp import FastMCP
@@ -17,8 +18,14 @@ from knowledge_graph import knowledge_graph
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("GCE-MCP")
+from mcp.server.fastmcp.server import TransportSecuritySettings
 
-mcp = FastMCP("GCE-MCP")
+mcp = FastMCP(
+    "GCE-MCP",
+    host=settings.GCE_HOST,
+    port=settings.GCE_PORT,
+    transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False)
+)
 
 # Inicjalizacja splittera zgodnie z ustawieniami
 text_splitter = RecursiveCharacterTextSplitter(
@@ -99,7 +106,7 @@ def should_ignore(uri: str) -> bool:
 async def gce_list_namespaces() -> str:
     """Listuje wszystkie dostępne przestrzenie nazw (Namespaces) w bazie GCE."""
     try:
-        stats = vector_store.get_stats()
+        stats = await asyncio.to_thread(vector_store.get_stats)
         ns_list = stats.get('namespaces', ['default'])
         return "📂 **GCE Namespaces:**\n" + "\n".join([f"- {ns}" for ns in ns_list])
     except Exception as e:
@@ -123,7 +130,12 @@ async def gce_index_folder(path: str, extensions: str = ".py,.md,.ts,.tsx,.yaml,
                 await asyncio.sleep(settings.THROTTLE_DELAY)
             elif "Pominięto" in res:
                 skipped += 1
-        return f"📂 **Index Folder Complete**: `{path}` (Namespace: {namespace})\nZindeksowano: {indexed}, Pominięto: {skipped}."
+        
+        # Jeśli zindeksowano nowe pliki, wywołaj optymalizację asynchronicznie
+        if indexed > 0:
+            await asyncio.to_thread(vector_store.optimize)
+            
+        return f"📂 **Index Folder Complete**: `{path}` (Namespace: {namespace})\nZindeksowano: {indexed}, Pominięto: {skipped} (Tabela zoptymalizowana)."
     except Exception as e:
         return f"Błąd indeksowania folderu: {e}"
 
@@ -153,25 +165,91 @@ async def gce_add_resource(uri: str, content: str = "", abstract: str = "", name
         splitter = RecursiveCharacterTextSplitter.from_language(lang, settings.CHUNK_SIZE, settings.CHUNK_OVERLAP)
         chunks = splitter.split_text(content, language=lang)
         metadata = {"relations": extract_relations_simple(content, uri)}
+        
+        # Współbieżne generowanie embeddingów dla wszystkich chunków
+        chunk_texts = [f"{abstract}\n\n{chunk}" for chunk in chunks]
+        vectors = await embedding_engine.embed_batch(chunk_texts)
+        
         doc_chunks = []
         for i, chunk in enumerate(chunks):
             chunk_uri = f"{uri}#chunk{i}"
-            vector = await embedding_engine.embed_text(f"{abstract}\n\n{chunk}")
             doc_chunks.append({
                 "uri": chunk_uri, "text": chunk, "abstract": abstract, 
-                "vector": vector, "metadata": json.dumps(metadata),
+                "vector": vectors[i], "metadata": json.dumps(metadata),
                 "namespace": namespace
             })
-        vector_store.add_documents(doc_chunks)
+        await asyncio.to_thread(vector_store.add_documents, doc_chunks)
         cache[cache_key] = current_hash
         save_index_cache(cache)
         return f"Sukces. Zasób {uri} dodany do namespace '{namespace}'."
     except Exception as e:
         return await gce_guardian_diagnostic(e, "gce_add_resource", f"URI: {uri}")
 
+async def semantic_arbitration(new_content: str, new_uri: str, candidates: List[dict]) -> tuple[str, Optional[str], str]:
+    """
+    Sprawdza relację semantyczną nowego faktu do najbardziej zbliżonych faktów w bazie.
+    Zwraca: (action: 'DUPLICATE' | 'SUPERSEDES' | 'NO_CONFLICT', target_uri, reason)
+    """
+    if not candidates:
+        return "NO_CONFLICT", None, ""
+
+    formatted = []
+    for c in candidates:
+        c_uri = c.get('uri')
+        if c_uri == new_uri:
+            continue
+        c_text = c.get('text', '').strip()
+        formatted.append(f"- [{c_uri}]: \"{c_text}\"")
+
+    if not formatted:
+        return "NO_CONFLICT", None, ""
+
+    formatted_str = "\n".join(formatted[:3])
+    prompt = f"""Jesteś strażnikiem spójności pamięci GCE (Semantic Memory Arbiter).
+Porównaj NOWY FAKT z ISTNIEJĄCYMI FAKTAMI w bazie wiedzy.
+
+NOWY FAKT (URI: {new_uri}):
+"{new_content}"
+
+ISTNIEJĄCE FAKTY:
+{formatted_str}
+
+ZADANIE:
+Oceń relację nowego faktu do istniejących faktów. Wybierz dokładnie JEDNĄ akcję:
+1. DUPLICATE: <uri_istniejacego> - jeśli nowy fakt nie wnosi nowych informacji i jest powtórzeniem.
+2. SUPERSEDES: <uri_istniejacego> - jeśli nowy fakt aktualizuje, unieważnia lub naprawia stan opisany w starym fakcie (np. zmiana konfiguracji, nowa wersja, rozwiązanie problemu).
+3. NO_CONFLICT - jeśli to odrębna informacja i powinna współistnieć.
+
+Format odpowiedzi (dokładnie 2 linie):
+ACTION: <DUPLICATE: uri | SUPERSEDES: uri | NO_CONFLICT>
+UZASADNIENIE: <krótkie wyjaśnienie w 1 zdaniu>"""
+
+    try:
+        response = await quota_manager.generate_content(prompt)
+        action_match = re.search(r'ACTION:\s*([A-Z_]+)(?::\s*(\S+))?', response)
+        reason_match = re.search(r'UZASADNIENIE:\s*(.+)', response)
+        reason = reason_match.group(1).strip() if reason_match else ""
+        if action_match:
+            action = action_match.group(1).strip()
+            target_uri = action_match.group(2).strip() if action_match.group(2) else None
+            return action, target_uri, reason
+        return "NO_CONFLICT", None, ""
+    except Exception as e:
+        logger.warning(f"Semantic arbitration failed: {e}. Falling back to normal write.")
+        return "NO_CONFLICT", None, ""
+
+@mcp.tool()
+async def gce_delete_memory(uri: str) -> str:
+    """Usuwa wskazany fakt/wspomnienie z bazy LanceDB po jego pełnym URI."""
+    try:
+        await asyncio.to_thread(vector_store.delete, uri)
+        return f"🗑️ Pomyślnie usunięto pamięć: `{uri}`"
+    except Exception as e:
+        return f"Błąd usuwania pamięci {uri}: {e}"
+
 @mcp.tool()
 async def gce_add_memory(content: str, label: str, namespace: str = "memories") -> str:
-    """Zapisuje fakt bezpośrednio do konkretnego namespace (domyślnie: memories)."""
+    """Zapisuje fakt bezpośrednio do konkretnego namespace (z automatyczną detekcją duplikatów i konfliktów semantycznych)."""
     try:
         safe_label = re.sub(r'[^a-z0-9]', '_', label.lower())
         uri = f"gce://user/memories/{safe_label}"
@@ -181,14 +259,49 @@ async def gce_add_memory(content: str, label: str, namespace: str = "memories") 
             abstract = abstract.strip().strip('"').replace("\n", " ")
         except:
             abstract = f"Memory: {label}"
-        metadata = {"relations": []}
+
         vector = await embedding_engine.embed_text(f"{abstract}\n\n{content}")
-        vector_store.add_documents([{
+        timestamp = datetime.now().isoformat()
+        metadata = {"relations": [], "updated_at": timestamp}
+
+        # --- MECHANIZM 1: SEMANTIC PRE-CHECK ---
+        similar_docs = await asyncio.to_thread(
+            vector_store.hybrid_search,
+            query=content,
+            query_vector=vector,
+            limit=3,
+            namespace=namespace
+        )
+
+        action, target_uri, reason = await semantic_arbitration(content, uri, similar_docs)
+
+        if action == "DUPLICATE" and target_uri and target_uri != uri:
+            logger.info(f"Memory skipped (duplicate of {target_uri}): {reason}")
+            return f"ℹ️ **Pominięto (Duplikat)**: Fakt o tej treści istnieje już pod `{target_uri}`.\nPowód: {reason}"
+
+        status_msg = f"Zapamiętano: {uri} w namespace '{namespace}' (Label: {abstract})"
+
+        if action == "SUPERSEDES" and target_uri and target_uri != uri:
+            logger.info(f"Superseding old memory {target_uri} with {uri}: {reason}")
+            await asyncio.to_thread(vector_store.delete, target_uri)
+            status_msg = f"🔄 **Zaktualizowano (Zastąpiono nieaktualny fakt)**:\n- Usunięto: `{target_uri}`\n- Zapisano nowy: `{uri}`\n- Uzasadnienie: {reason}"
+
+        await asyncio.to_thread(vector_store.add_documents, [{
             "uri": uri, "text": content, "abstract": abstract, 
             "vector": vector, "metadata": json.dumps(metadata),
             "namespace": namespace
         }])
-        return f"Zapamiętano: {uri} w namespace '{namespace}' (Label: {abstract})"
+
+        # Synchronizacja faktu do skarbca Obsidian
+        if namespace == "memories":
+            try:
+                from obsidian_diff_arbiter import write_memory_to_vault
+                vault_file = await asyncio.to_thread(write_memory_to_vault, content, label, "general")
+                status_msg += f"\n📁 **Zsynchronizowano do Obsidiana**: `{vault_file}`"
+            except Exception as e:
+                logger.warning(f"Błąd synchronizacji do Obsidiana: {e}")
+
+        return status_msg
     except Exception as e:
         return await gce_guardian_diagnostic(e, "gce_add_memory", f"Label: {label}")
 
@@ -239,13 +352,35 @@ async def gce_search_context(query: str, limit: int = 5, where: Optional[str] = 
     try:
         query_vector = await embedding_engine.embed_text(query)
         
-        # 1. Główne wyszukiwanie w wybranym namespace
-        results = vector_store.hybrid_search(query=query, query_vector=query_vector, limit=limit, where=where, namespace=namespace)
-        
-        # 2. Inteligentne dołączanie wzorców (jeśli nie szukamy już w patterns)
-        pattern_results = []
+        # 1. Główne wyszukiwanie + 2. Inteligentne dołączanie wzorców równolegle (asyncio.gather)
         if namespace != "patterns":
-            pattern_results = vector_store.hybrid_search(query=query, query_vector=query_vector, limit=2, namespace="patterns")
+            results, pattern_results = await asyncio.gather(
+                asyncio.to_thread(
+                    vector_store.hybrid_search, 
+                    query=query, 
+                    query_vector=query_vector, 
+                    limit=limit, 
+                    where=where, 
+                    namespace=namespace
+                ),
+                asyncio.to_thread(
+                    vector_store.hybrid_search, 
+                    query=query, 
+                    query_vector=query_vector, 
+                    limit=2, 
+                    namespace="patterns"
+                )
+            )
+        else:
+            results = await asyncio.to_thread(
+                vector_store.hybrid_search, 
+                query=query, 
+                query_vector=query_vector, 
+                limit=limit, 
+                where=where, 
+                namespace=namespace
+            )
+            pattern_results = []
         
         if not results and not pattern_results:
             return "Brak wyników."
@@ -261,6 +396,14 @@ async def gce_search_context(query: str, limit: int = 5, where: Optional[str] = 
 
         for i, res in enumerate(results, 1):
             response += f"{i}. SOURCE: {res['uri']} [{res.get('namespace', 'default')}]\n"
+            meta_str = res.get('metadata', '{}')
+            try:
+                meta_obj = json.loads(meta_str) if isinstance(meta_str, str) else meta_str
+                updated_at = meta_obj.get('updated_at')
+                if updated_at:
+                    response += f"   DATE: {updated_at.split('T')[0]}\n"
+            except Exception:
+                pass
             if res.get('abstract'):
                 response += f"   LABEL: {res['abstract']}\n"
             response += f"   CONTENT: {res['text']}\n"
@@ -274,7 +417,8 @@ async def gce_search_context(query: str, limit: int = 5, where: Optional[str] = 
 async def gce_get_stats() -> str:
     """Zwraca rozszerzone statystyki bazy danych GCE per namespace."""
     try:
-        db_stats = vector_store.get_stats()
+        # Asynchroniczne wywołanie get_stats (wykonuje m.in. subprocess 'du' oraz zapytanie LanceDB)
+        db_stats = await asyncio.to_thread(vector_store.get_stats)
         model_stats = quota_manager.get_stats()
         report = "📊 **GCE SYSTEM STATS**\n\n"
         report += f"**Database (LanceDB):**\n"
@@ -347,14 +491,14 @@ async def gce_init_spec(project_path: str, description: str) -> str:
 async def gce_add_relation(subject_uri: str, predicate: str, object_uri: str) -> str:
     """Tworzy relację między dwoma zasobami w GCE."""
     try:
-        doc = vector_store.get_by_uri(subject_uri)
+        doc = await asyncio.to_thread(vector_store.get_by_uri, subject_uri)
         if not doc: return f"Błąd: Podmiot {subject_uri} nie istnieje."
         current_meta = json.loads(doc.get('metadata', '{}'))
         relations = current_meta.get('relations', [])
         if not any(r['predicate'] == predicate and r['object_uri'] == object_uri for r in relations):
             relations.append({"predicate": predicate, "object_uri": object_uri})
             current_meta['relations'] = relations
-            vector_store.update_metadata(subject_uri, current_meta)
+            await asyncio.to_thread(vector_store.update_metadata, subject_uri, current_meta)
             return f"Sukces: Utworzono relację {subject_uri} --({predicate})--> {object_uri}"
         return f"Relacja już istnieje."
     except Exception as e:
@@ -384,8 +528,17 @@ async def gce_consolidate_memories(content: str, category: str = "general") -> s
             uri = f"gce://user/memories/{category}_{label}"
             vector = await embedding_engine.embed_text(f"Memory: {label}\n\n{fact}")
             doc_chunks.append({"uri": uri, "text": fact, "abstract": f"Memory: {label}", "vector": vector, "metadata": "{}", "namespace": "memories"})
-        vector_store.add_documents(doc_chunks)
-        return f"Sukces: Zapisano {len(doc_chunks)} faktów w kategorii '{category}'."
+        await asyncio.to_thread(vector_store.add_documents, doc_chunks)
+
+        # Synchronizacja skonsolidowanych faktów do skarbca Obsidian
+        try:
+            from obsidian_diff_arbiter import write_memory_to_vault
+            for fact in facts:
+                await asyncio.to_thread(write_memory_to_vault, fact, category, category)
+        except Exception as e:
+            logger.warning(f"Błąd zapisu skonsolidowanych wspomnień do Obsidiana: {e}")
+
+        return f"Sukces: Zapisano {len(doc_chunks)} faktów w kategorii '{category}' (zsynchronizowano do Obsidiana)."
     except Exception as e:
         return f"Błąd konsolidacji: {e}"
 
@@ -396,7 +549,12 @@ async def gce_mine_patterns(context: str) -> str:
         extraction_prompt = f"Zidentyfikuj kluczowe tematy: {context[:1000]}"
         topics = await quota_manager.generate_content(extraction_prompt)
         query_vector = await embedding_engine.embed_text(topics)
-        past_memories = vector_store.hybrid_search(query=topics, query_vector=query_vector, limit=5)
+        past_memories = await asyncio.to_thread(
+            vector_store.hybrid_search, 
+            query=topics, 
+            query_vector=query_vector, 
+            limit=5
+        )
         memories_text = "\n".join([f"- {m['uri']}: {m['text']}" for m in past_memories])
         mining_prompt = f"Jesteś GCE Pattern Miner. Analizuj: {context}\nHistoria: {memories_text}"
         report = await quota_manager.generate_content(mining_prompt)
@@ -406,18 +564,31 @@ async def gce_mine_patterns(context: str) -> str:
 
 @mcp.tool()
 async def gce_cleanup() -> str:
-    """Usuwa nieistniejące zasoby z bazy."""
+    """Usuwa nieistniejące zasoby z bazy oraz optymalizuje pliki tabeli LanceDB."""
     try:
-        results = vector_store.table.search().to_list()
+        results = await asyncio.to_thread(lambda: vector_store.table.search().select(["uri"]).to_list())
         all_uris = list(set([res['uri'].split('#')[0] for res in results]))
         removed_count = 0
         for uri in all_uris:
             if uri.startswith("/") and not os.path.exists(uri):
-                vector_store.table.delete(f"uri LIKE '{uri}%'")
+                await asyncio.to_thread(vector_store.delete, uri)
                 removed_count += 1
-        return f"🧹 **GCE Cleanup Complete**: Usunięto {removed_count} zasobów."
+        
+        # Wywołujemy optymalizację plików w osobnym wątku
+        await asyncio.to_thread(vector_store.optimize)
+        
+        return f"🧹 **GCE Cleanup & Optimization Complete**: Usunięto {removed_count} zasobów."
     except Exception as e:
         return f"Błąd czyszczenia: {e}"
+
+@mcp.tool()
+async def gce_migrate_viking_uris() -> str:
+    """Migruje wszystkie zasoby i pamięci ze starego schematu 'viking://' na 'gce://' w LanceDB."""
+    try:
+        res = await asyncio.to_thread(vector_store.migrate_viking_to_gce)
+        return f"🚀 **GCE URI Migration Complete**: Zmigrowano {res['migrated']} rekordów ze schematu viking:// na gce://. Status: {res['status']}"
+    except Exception as e:
+        return f"Błąd migracji URI: {e}"
 
 @mcp.tool()
 async def gce_init_project_context(path: str, description: str) -> str:
@@ -456,9 +627,12 @@ async def gce_log_decision(project_path: str, decision: str, context: str = "") 
 
 @mcp.tool()
 async def gce_query_project_health(path: str) -> str:
-    """Analizuje spójność bazy wiedzy."""
+    """Analizuje spójność bazy wiedzy z bezpiecznym eskapowaniem cudzysłowów."""
     try:
-        results = vector_store.table.search().where(f"uri LIKE '{path}%'").to_list()
+        escaped_path = path.replace("'", "''")
+        results = await asyncio.to_thread(
+            lambda: vector_store.table.search().where(f"uri LIKE '{escaped_path}%'").to_list()
+        )
         if not results: return f"Brak zasobów."
         uris = {res['uri'].split('#')[0] for res in results}
         report = f"📋 **GCE Project Health**: Indexed {len(uris)} resources."
@@ -479,7 +653,7 @@ async def gce_doctor(fix: bool = False) -> str:
     except Exception as e: vitals.append(f"❌ Ollama ERROR: {e}")
     
     try:
-        stats = vector_store.get_stats()
+        stats = await asyncio.to_thread(vector_store.get_stats)
         vitals.append(f"✅ LanceDB OK ({stats['total_chunks']} chunks)")
     except Exception as e: vitals.append(f"❌ Database ERROR: {e}")
     
@@ -499,7 +673,13 @@ async def gce_doctor(fix: bool = False) -> str:
     # 3. Pobieranie kontekstu zmian (Recent Decisions/Patterns)
     try:
         query_vector = await embedding_engine.embed_text("recent changes architecture patterns")
-        recent_changes = vector_store.hybrid_search(query="recent changes", query_vector=query_vector, limit=5, namespace="patterns")
+        recent_changes = await asyncio.to_thread(
+            vector_store.hybrid_search, 
+            query="recent changes", 
+            query_vector=query_vector, 
+            limit=5, 
+            namespace="patterns"
+        )
         changes_text = "\n".join([f"- {c['uri']}: {c['text']}" for c in recent_changes])
     except:
         changes_text = "Brak dostępnych wzorców w pamięci."
@@ -584,7 +764,7 @@ async def gce_diary_write(agent_name: str, entry: str, topic: str = "general") -
         }
         
         vector = await embedding_engine.embed_text(diary_content)
-        vector_store.add_documents([{
+        await asyncio.to_thread(vector_store.add_documents, [{
             "uri": uri, "text": diary_content, "abstract": abstract,
             "vector": vector, "metadata": json.dumps(metadata),
             "namespace": "diaries"
@@ -600,9 +780,11 @@ async def gce_diary_read(agent_name: str, limit: int = 5) -> str:
         safe_name = re.sub(r'[^a-z0-9]', '_', agent_name.lower())
         
         # LanceDB pozwala na wyszukiwanie przez SQL, pobieramy wpisy z namespace="diaries"
-        results = vector_store.table.search().where(
-            f"namespace = 'diaries' AND uri LIKE 'gce://agent/diaries/{safe_name}/%'"
-        ).to_list()
+        results = await asyncio.to_thread(
+            lambda: vector_store.table.search().where(
+                f"namespace = 'diaries' AND uri LIKE 'gce://agent/diaries/{safe_name}/%'"
+            ).to_list()
+        )
         
         if not results:
             return f"Brak wpisów w dzienniku sesyjnym dla '{agent_name}'."
@@ -643,7 +825,7 @@ async def gce_kg_add(subject: str, predicate: str, object: str,
 
 @mcp.tool()
 async def gce_kg_invalidate(subject: str, predicate: str, object: str, 
-                            ended: Optional[str] = None) -> str:
+                             ended: Optional[str] = None) -> str:
     """Oznacza fakt w grafie jako nieaktualny (ustawia datę valid_to)."""
     try:
         count = knowledge_graph.invalidate_triple(
@@ -709,4 +891,40 @@ async def gce_kg_stats() -> str:
         return f"Błąd statystyk KG: {e}"
 
 if __name__ == "__main__":
-    mcp.run()
+    import argparse
+    parser = argparse.ArgumentParser(description="GCE-MCP Server")
+    parser.add_argument("--transport", default=os.getenv("GCE_TRANSPORT", "stdio"), choices=["stdio", "sse", "streamable-http"])
+    parser.add_argument("--host", default=os.getenv("GCE_HOST", settings.GCE_HOST))
+    parser.add_argument("--port", type=int, default=int(os.getenv("GCE_PORT", settings.GCE_PORT)))
+    args, _ = parser.parse_known_args()
+
+    if args.transport in ("sse", "streamable-http"):
+        mcp.settings.host = args.host
+        mcp.settings.port = args.port
+        logger.info(f"Starting GCE-MCP server on {args.host}:{args.port} (dual SSE + Streamable HTTP)...")
+        from starlette.applications import Starlette
+        from starlette.routing import Route
+        import uvicorn
+        import asyncio
+
+        sse_app = mcp.sse_app()
+        stream_app = mcp.streamable_http_app()
+
+        routes = list(sse_app.routes) + list(stream_app.routes)
+        routes.append(Route(mcp.settings.sse_path, endpoint=stream_app.routes[0].endpoint, methods=["POST", "DELETE"]))
+
+        combined_app = Starlette(
+            routes=routes,
+            lifespan=lambda app: mcp.session_manager.run()
+        )
+
+        config = uvicorn.Config(
+            combined_app,
+            host=args.host,
+            port=args.port,
+            log_level=mcp.settings.log_level.lower()
+        )
+        server = uvicorn.Server(config)
+        asyncio.run(server.serve())
+    else:
+        mcp.run(transport="stdio")

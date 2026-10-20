@@ -141,17 +141,20 @@ class KnowledgeGraph:
             cursor.execute("SELECT COUNT(*) FROM triples WHERE valid_to IS NULL")
             active_triples = cursor.fetchone()[0]
             
-            cursor.execute("SELECT COUNT(DISTINCT subject) FROM triples")
-            unique_subjects = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT COUNT(DISTINCT object) FROM triples")
-            unique_objects = cursor.fetchone()[0]
+            cursor.execute("""
+                SELECT COUNT(DISTINCT entity) FROM (
+                    SELECT subject AS entity FROM triples
+                    UNION
+                    SELECT object AS entity FROM triples
+                )
+            """)
+            unique_entities = cursor.fetchone()[0]
             
         return {
             "total_facts": total_triples,
             "active_facts": active_triples,
             "expired_facts": total_triples - active_triples,
-            "unique_entities": len(set([row for row in (unique_subjects, unique_objects)])) # Proste przybliżenie
+            "unique_entities": unique_entities
         }
 
 knowledge_graph = KnowledgeGraph()

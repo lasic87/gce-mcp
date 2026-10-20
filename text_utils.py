@@ -114,7 +114,7 @@ class RecursiveCharacterTextSplitter:
 
     def split_text(self, text: str, language: Optional[str] = None) -> List[str]:
         # GCE 3.0 Hybrid Strategy: AST first, then Recursive
-        if language and language in ["python", "ts", "typescript"]:
+        if language and language in ["python", "ts", "typescript", "tsx", "js"]:
             ast_splitter = ASTCodeSplitter(language, self.chunk_size)
             ast_chunks = ast_splitter.split_code(text)
             if ast_chunks:

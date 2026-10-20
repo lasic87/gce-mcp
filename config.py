@@ -26,20 +26,24 @@ class Settings(BaseSettings):
     # GCE 2.3: Orchestrator Ready
     PROJECT_CONTEXT_DIR: str = ".gce" # Folder bazy wiedzy wewnątrz projektu
     
+    # GCE Network Server (SSE / HTTP)
+    GCE_HOST: str = "0.0.0.0"
+    GCE_PORT: int = 8112
+    
     # Modele do Juggler'a (nazwa, rpm_limit, rpd_limit)
     MODEL_POOL: list[dict] = [
-        {"name": "models/gemini-3.1-flash-lite-preview", "rpm": 15, "rpd": 500},
+        {"name": "models/gemini-2.5-flash", "rpm": 15, "rpd": 1000},
+        {"name": "models/gemini-2.5-flash-lite", "rpm": 15, "rpd": 1000},
+        {"name": "models/gemini-3.5-flash-lite", "rpm": 15, "rpd": 1000},
+        {"name": "models/gemini-3.1-flash-lite", "rpm": 15, "rpd": 1000},
+        {"name": "models/gemini-flash-latest", "rpm": 15, "rpd": 1000},
+        {"name": "models/gemini-flash-lite-latest", "rpm": 15, "rpd": 1000},
         {"name": "models/gemini-3-flash-preview", "rpm": 15, "rpd": 1000},
-        {"name": "models/gemini-3.1-pro-preview", "rpm": 5, "rpd": 50},
-        {"name": "models/deep-research-pro-preview-12-2025", "rpm": 2, "rpd": 10},
-        {"name": "models/gemini-2.5-flash-lite", "rpm": 10, "rpd": 20},
-        {"name": "models/gemini-2.5-flash", "rpm": 5, "rpd": 20},
-        {"name": "models/gemma-4-31b-it", "rpm": 25, "rpd": 14000},
-        {"name": "models/gemma-4-26b-a4b-it", "rpm": 25, "rpd": 14000},
-        {"name": "models/gemma-3-27b-it", "rpm": 25, "rpd": 14000},
-        {"name": "models/gemma-3-12b-it", "rpm": 25, "rpd": 14000},
-        {"name": "models/gemma-3-4b-it", "rpm": 25, "rpd": 14000},
-        {"name": "models/gemma-3-1b-it", "rpm": 25, "rpd": 14000}
+        {"name": "models/gemini-3.1-flash-lite-preview", "rpm": 15, "rpd": 500},
+        {"name": "models/gemini-3.7-flash", "rpm": 15, "rpd": 1000},
+        {"name": "models/gemini-3.8-flash", "rpm": 15, "rpd": 1000},
+        {"name": "models/gemma-4-26b-a4b-it", "rpm": 15, "rpd": 1000},
+        {"name": "models/gemini-3.6-flash", "rpm": 15, "rpd": 20}
     ]
 
 settings = Settings()

@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import re
 from datetime import datetime, timedelta
 from google import genai
 from google.genai import types
@@ -16,6 +17,7 @@ class ModelStats:
         self.current_rpm = 0
         self.current_rpd = 0
         self.last_reset_rpm = datetime.now()
+        self.last_reset_rpd = datetime.now()
         self.is_blocked_until = None
 
     def can_use(self) -> bool:
@@ -24,6 +26,10 @@ class ModelStats:
             self.current_rpm = 0
             self.last_reset_rpm = now
         
+        if now.date() > self.last_reset_rpd.date():
+            self.current_rpd = 0
+            self.last_reset_rpd = now
+
         if self.is_blocked_until and now < self.is_blocked_until:
             return False
         if self.current_rpm >= self.rpm_limit:
@@ -78,10 +84,12 @@ class QuotaManager:
         return stats_list
 
     async def close(self):
-        """Zamyka sesję asynchroniczną klienta Gemini."""
+        """Zamyka sesję klienta Gemini."""
         try:
-            # Nowe SDK Google GenAI używa klienta aio, który należy zamknąć
-            await self.client.aio.close()
+            if hasattr(self.client, "close"):
+                self.client.close()
+            elif hasattr(self.client, "aio") and hasattr(self.client.aio, "close"):
+                await self.client.aio.close()
             logger.info("Gemini client session closed successfully.")
         except Exception as e:
             logger.error(f"Error closing Gemini session: {e}")
@@ -114,10 +122,13 @@ class QuotaManager:
                                 )
                             )
 
-                    response = await self.client.aio.models.generate_content(
-                        model=model_name,
-                        contents=prompt,
-                        config=config
+                    response = await asyncio.wait_for(
+                        self.client.aio.models.generate_content(
+                            model=model_name,
+                            contents=prompt,
+                            config=config
+                        ),
+                        timeout=12.0
                     )
                     
                     # Logowanie myśli (jeśli model je zwrócił)
@@ -130,11 +141,25 @@ class QuotaManager:
                         logger.info(f"Model thought: {' '.join(thoughts)[:200]}...")
                         
                     return response.text
+                except asyncio.TimeoutError:
+                    logger.warning(f"Timeout (12s) generating content with {self.current_model_stats.name}. Blocking for 60s and switching model...")
+                    self.current_model_stats.block_temporary(60)
+                    continue
                 except Exception as e:
                     error_str = str(e).lower()
-                    if "429" in error_str or "quota" in error_str or "limit" in error_str:
-                        logger.warning(f"Quota hit for {self.current_model_stats.name}. Blocking and retrying...")
-                        self.current_model_stats.block_temporary()
+                    if "429" in error_str or "quota" in error_str or "limit" in error_str or "503" in error_str or "unavailable" in error_str or "high demand" in error_str:
+                        block_sec = 60
+                        if "per day" in error_str or "daily" in error_str or "perprojectpermodel-freetier" in error_str or "retrydelay" in error_str:
+                            delay_match = re.search(r"retrydelay['\":\s]+(\d+)", error_str)
+                            if delay_match:
+                                block_sec = int(delay_match.group(1)) + 10
+                            else:
+                                block_sec = 3600 * 6
+                            self.current_model_stats.current_rpd = self.current_model_stats.rpd_limit
+                            logger.warning(f"Daily quota reached for {self.current_model_stats.name}. Marking RPD exhausted and blocking for {block_sec}s.")
+                        else:
+                            logger.warning(f"Quota/Capacity hit for {self.current_model_stats.name} ({e}). Blocking and retrying...")
+                        self.current_model_stats.block_temporary(block_sec)
                         continue
                     else:
                         logger.error(f"Error generating content with {self.current_model_stats.name}: {e}")
